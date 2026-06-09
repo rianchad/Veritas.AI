@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Veritas.ai",
+  "version": "0.1.0",
+  "description": "Real-time fact-checking for news articles. Extracts claims, verifies them against primary sources and cross-outlet coverage, and shows confidence levels — never hard verdicts.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": ["activeTab", "scripting", "sidePanel", "storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "side_panel": {
+    "default_path": "sidebar.html"
+  },
+  "action": {
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    },
+    "default_title": "Open Veritas.ai"
+  }
+}

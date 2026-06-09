@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Veritas.ai</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700&family=DM+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="sidebar.css" />
+  </head>
+  <body>
+    <header class="header">
+      <div class="header__wordmark">
+        <span class="header__name">Veritas.ai</span>
+        <span class="header__tagline">Fact Intelligence</span>
+      </div>
+      <img class="header__logo" src="icons/icon128.png" alt="" />
+    </header>
+    <div class="header__rule"></div>
+
+    <main id="content" class="content">
+      <!-- Appears when the user highlights text in the article -->
+      <div id="selection-popup" class="selection-popup hidden">
+        <p id="selection-preview" class="selection-popup__preview"></p>
+        <div class="selection-popup__actions">
+          <button id="selection-check-btn" class="btn btn--primary btn--sm">Verify claim</button>
+          <button id="selection-dismiss-btn" class="selection-popup__dismiss" aria-label="Dismiss">✕</button>
+        </div>
+      </div>
+
+      <section id="state-idle" class="state">
+        <div class="idle-content">
+          <div class="idle-mark" aria-hidden="true">V</div>
+          <p class="idle-text">Open a news article, then begin analysis to surface fact context claim by claim.</p>
+          <button id="analyze-btn" class="btn btn--primary">Analyze this page</button>
+        </div>
+      </section>
+
+      <section id="state-loading" class="state hidden">
+        <div class="loading-content">
+          <div class="loading-ticker" aria-hidden="true">
+            <span></span><span></span><span></span><span></span><span></span>
+          </div>
+          <p id="loading-message" class="loading-text">Reading the article…</p>
+        </div>
+      </section>
+
+      <section id="state-error" class="state hidden">
+        <p id="error-message" class="error-text">Something went wrong.</p>
+        <button id="retry-btn" class="btn btn--secondary">Try again</button>
+      </section>
+
+      <section id="state-results" class="state hidden">
+        <div id="article-meta" class="article-meta"></div>
+        <div id="credibility-score" class="credibility-score hidden">
+          <div class="credibility-score__header">
+            <span class="credibility-score__label">Credibility Index</span>
+            <span id="credibility-score__summary" class="credibility-score__summary"></span>
+          </div>
+          <div class="credibility-score__track">
+            <div id="credibility-score__fill" class="credibility-score__fill"></div>
+            <div class="credibility-score__ticks">
+              <span></span><span></span><span></span><span></span>
+            </div>
+          </div>
+        </div>
+        <div id="progress-container" class="progress-container">
+          <span id="progress-text" class="progress-text">Checking claims…</span>
+          <div class="progress-track">
+            <div id="progress-fill" class="progress-fill"></div>
+          </div>
+        </div>
+        <ul id="claims-list" class="claims-list"></ul>
+        <div id="share-row" class="share-row hidden">
+          <button id="share-btn" class="btn btn--ghost btn--sm">Share analysis</button>
+          <span id="share-toast" class="share-toast hidden">Link copied to clipboard</span>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <p>Veritas.ai surfaces sources and confidence levels — it never issues verdicts.</p>
+    </footer>
+
+    <script src="sidebar.js"></script>
+  </body>
+</html>
