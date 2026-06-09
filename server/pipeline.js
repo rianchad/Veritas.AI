@@ -13,7 +13,7 @@ const Anthropic = require("@anthropic-ai/sdk");
 const { searchWeb } = require("./search");
 const { getDomain, getLean, isPrimarySource } = require("./sourceLean");
 
-const MODEL = "claude-haiku-4-5-20251001";
+const MODEL = "claude-sonnet-4-20250514";
 
 let anthropicClient = null;
 function client() {
@@ -250,13 +250,9 @@ Confidence thresholds — apply these strictly:
 - "medium": The claim has some support but meaningful gaps remain — indirect evidence only, mixed signals, OR one credible contradicting source among several supporting ones.
 - "low": No sources confirm the claim, sources actively contradict it, or the results do not address the claim at all.
 
-Recent events rule:
-- When multiple reputable sources consistently report the same recent event — deaths, elections, appointments, verdicts — treat that consensus as sufficient for High confidence even if the event postdates your training data. Do not flag recent verified events as uncertain or speculative when 3 or more credible outlets confirm them. Trust the search results over your own training knowledge for recent events.
-
 Contradiction rules:
 - Before flagging a source as contradicting, check whether the apparent discrepancy is a time zone difference (e.g., 7:30 p.m. CT vs 8:30 p.m. ET are the same moment), a unit difference, or a rounding difference. If so, it is NOT a true contradiction — treat both sources as supporting.
 - A single low-credibility or local source contradicting several major outlets is weak contradiction. Favor "high" confidence if 4+ credible sources agree.
-- Before flagging a contradiction, check for mathematical and logical equivalence. If one source says 4 total tours and another says 3 tours in Iraq plus 1 in Afghanistan, these are equivalent — do not mark them as contradictions. Apply the same logic to percentages vs fractions, dollar amounts expressed in different units, date ranges that overlap, and any numerical claim where the underlying value is identical despite different phrasing. Only flag genuine factual disagreements where the underlying values or facts cannot be reconciled.
 
 Additional rules:
 - Only cite outlets/URLs that appear in the search results above — never invent sources.
