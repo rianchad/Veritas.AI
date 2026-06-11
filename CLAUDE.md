@@ -151,3 +151,4 @@ Article page load
 - The sidebar should feel like a native browser panel — clean, minimal, fast
 - Test prompts on real articles from CNN, Fox News, NYT, AP, Reuters before finalizing
 - When in doubt on UI decisions, refer to the core principle: research assistant, not arbiter
+

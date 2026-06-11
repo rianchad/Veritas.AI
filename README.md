@@ -220,4 +220,4 @@ npm run dev   # or npm start for production
 - **Primary sources first.** Government data, wire dispatches, and academic sources are surfaced above media coverage.
 - **Spectrum diversity.** Lean labels are shown so readers can see whether support comes from one side of the political spectrum or many.
 - **Fail gracefully.** Paywalls, missing dates, empty search results, and API errors all have defined fallback states — nothing silently breaks.
-- **Latency budget.** The volatility classifier and claim extractor are sequential (~2s combined); per-claim fact-checks run in parallel and stream as they finish.
+- **Latency budget*.** The volatility classifier and claim extractor are sequential (~2s combined); per-claim fact-checks run in parallel and stream as they finish.
