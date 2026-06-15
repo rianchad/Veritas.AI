@@ -1295,5 +1295,4 @@ async function init() {
 
   showState("idle");
 }
-
 init();
