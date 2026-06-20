@@ -747,3 +747,19 @@ function getOutletData(outletName) {
   if (!outletName) return null;
   return OUTLET_DATA.get(outletName.trim().toLowerCase()) || null;
 }
+
+/**
+ * Collapses an outlet's fine-grained lean label (e.g. "Lean Left") into its
+ * broad category, mirroring server/sourceLean.js's getLeanCategory.
+ * @param {string} outletName - Outlet name as returned by the server.
+ * @returns {"Left"|"Right"|"Center"|"Unrated"}
+ */
+function getLeanCategory(outletName) {
+  const data = getOutletData(outletName);
+  const lean = data ? data.lean : null;
+  if (!lean) return "Unrated";
+  if (lean.endsWith("Left")) return "Left";
+  if (lean.endsWith("Right")) return "Right";
+  if (lean === "Center") return "Center";
+  return "Unrated";
+}
