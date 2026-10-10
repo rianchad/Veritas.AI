@@ -9,7 +9,13 @@
 // would gather. The search/synthesis split is isolated below so a multi-turn
 // tool-use loop can be dropped in later without touching the server routes.
 
-const Anthropic = require("@anthropic-ai/sdk");
+const {
+  Anthropic,
+  APIError,
+  APIConnectionTimeoutError,
+  AuthenticationError,
+  RateLimitError,
+} = require("@anthropic-ai/sdk");
 const { searchWeb } = require("./search");
 const { getDomain, getLean, isPrimarySource } = require("./sourceLean");
 
@@ -18,11 +24,17 @@ const MODEL = "claude-haiku-4-5-20251001";
 let anthropicClient = null;
 /**
  * Returns the shared Anthropic SDK client, creating it on first call.
- * @returns {import("@anthropic-ai/sdk").default}
+ * @returns {import("@anthropic-ai/sdk").Anthropic}
  */
 function client() {
   if (!anthropicClient) {
-    anthropicClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    anthropicClient = new Anthropic({
+      apiKey: process.env.ANTHROPIC_API_KEY,
+      // Haiku calls here finish in seconds. The SDK default (10 minutes per attempt, three
+      // attempts) would otherwise hold an SSE stream open for up to 30 minutes on a stall.
+      timeout: 60 * 1000,
+      maxRetries: 2,
+    });
   }
   return anthropicClient;
 }
@@ -45,22 +57,69 @@ function extractJson(text) {
 }
 
 /**
+ * Converts an Anthropic SDK error into an Error whose message is safe to show in the sidebar.
+ * @param {unknown} error - Error thrown by the SDK.
+ * @returns {Error}
+ */
+function describeAnthropicError(error) {
+  if (error instanceof RateLimitError) {
+    return new Error("The fact-check service is busy right now — please try again in a minute.");
+  }
+  if (error instanceof AuthenticationError) {
+    return new Error("Server misconfiguration: ANTHROPIC_API_KEY was rejected.");
+  }
+  if (error instanceof APIConnectionTimeoutError) {
+    return new Error("The request to Claude timed out — please try again.");
+  }
+  if (error instanceof APIError && error.status === 529) {
+    return new Error("Claude is temporarily overloaded — please try again shortly.");
+  }
+  if (error instanceof APIError) {
+    return new Error(`Claude request failed (${error.status ?? "network error"}).`);
+  }
+  if (error instanceof Error) {
+    return error;
+  }
+  return new Error(String(error));
+}
+
+/**
  * Sends a prompt to Claude and parses the response as JSON, retrying once on parse failure.
  * @param {string} prompt - The user message to send.
  * @param {{ maxTokens?: number, retries?: number }} [options]
- * @param {number} [options.maxTokens=1500] - Claude max_tokens cap.
+ * @param {number} [options.maxTokens=4096] - Claude max_tokens cap.
  * @param {number} [options.retries=1] - Number of extra attempts after a JSON parse failure.
  * @returns {Promise<unknown>} Parsed JSON value from Claude's response.
  * @throws {Error} If all attempts fail to produce valid JSON.
  */
-async function askClaudeForJson(prompt, { maxTokens = 1500, retries = 1 } = {}) {
+async function askClaudeForJson(prompt, { maxTokens = 4096, retries = 1 } = {}) {
   let lastError;
   for (let attempt = 0; attempt <= retries; attempt++) {
-    const response = await client().messages.create({
-      model: MODEL,
-      max_tokens: maxTokens,
-      messages: [{ role: "user", content: prompt }],
-    });
+    let response;
+    try {
+      response = await client().messages.create({
+        model: MODEL,
+        max_tokens: maxTokens,
+        messages: [{ role: "user", content: prompt }],
+      });
+    } catch (error) {
+      // Keep the upstream detail in server logs; the client only sees the sanitized message.
+      console.error("Anthropic request failed:", error?.status ?? "network", error?.message);
+      throw describeAnthropicError(error);
+    }
+
+    if (
+      response.stop_reason === "max_tokens" ||
+      response.stop_reason === "model_context_window_exceeded"
+    ) {
+      throw new Error(
+        `Claude response was truncated (${response.stop_reason}, max_tokens=${maxTokens}); raise the cap or shorten the input.`
+      );
+    }
+    if (response.stop_reason === "refusal") {
+      const why = response.stop_details?.explanation;
+      throw new Error(`Claude declined to process this content${why ? `: ${why}` : "."}`);
+    }
 
     const text = response.content
       .filter((block) => block.type === "text")
@@ -177,7 +236,7 @@ ${articleText.slice(0, 12000)}
  */
 async function extractClaims(articleText, claimCount = 5) {
   const result = await askClaudeForJson(CLAIM_EXTRACTION_PROMPT(articleText, claimCount), {
-    maxTokens: 1500,
+    maxTokens: 4096,
   });
 
   if (!Array.isArray(result?.claims) || result.claims.length < 1) {
@@ -258,7 +317,7 @@ Respond with ONLY a JSON array of the same length and shape as the input, with "
 async function disambiguateEntities(articleText, claims) {
   try {
     const rewritten = await askClaudeForJson(DISAMBIGUATION_PROMPT(articleText, claims), {
-      maxTokens: 1500,
+      maxTokens: 4096,
       retries: 1,
     });
     if (!Array.isArray(rewritten) || rewritten.length !== claims.length) {
@@ -372,6 +431,12 @@ Additional rules:
 - PRIMARY SOURCES are government data (.gov sites), official wire service dispatches (AP/Reuters), peer-reviewed academic sources (.edu, academic journals), official government transcripts, and intergovernmental bodies (UN, WHO, World Bank). Reliable media outlets such as BBC, NPR, CNN, or The Guardian do NOT qualify as primary sources regardless of their reputation — list those under supporting_sources instead.`;
 
 const RECENCY_THRESHOLD_MS = 10 * 60 * 60 * 1000;
+
+// Brave freshness filter per volatility level. Volatile stories are searched for recent
+// coverage first so applyRecencyAdjustment judges what is actually out there rather
+// than penalising an unfiltered search that happened to surface older background pieces.
+const FRESHNESS_BY_VOLATILITY = { breaking: "pd", developing: "pw" };
+const MIN_FRESH_RESULTS = 3;
 const CONFIDENCE_ORDER = ["high", "medium", "low"];
 
 /**
@@ -391,7 +456,10 @@ function applyRecencyAdjustment(result, volatility) {
 
   if (candidates.length === 0) return result; // no dates → can't assess; don't downgrade
 
-  const newestMs = Math.max(...candidates.map((s) => new Date(s.publishedAt).getTime()));
+  const times = candidates.map((s) => new Date(s.publishedAt).getTime()).filter(Number.isFinite);
+  if (times.length === 0) return result; // unparseable dates → can't assess; don't downgrade
+
+  const newestMs = Math.max(...times);
   if (Date.now() - newestMs <= RECENCY_THRESHOLD_MS) {
     return result; // fresh enough
   }
@@ -440,7 +508,19 @@ async function factCheckClaim(claim, context = null, pieceType = "news", volatil
   } else {
     searchQuery = claim;
   }
-  const rawResults = await searchWeb(searchQuery, { count: 8 });
+  const freshness = FRESHNESS_BY_VOLATILITY[volatility];
+  let rawResults;
+  if (freshness) {
+    rawResults = await searchWeb(searchQuery, { count: 8, freshness });
+    if (rawResults.length < MIN_FRESH_RESULTS) {
+      // Thin recent coverage — top up with an unfiltered search, de-duplicated by URL.
+      const broad = await searchWeb(searchQuery, { count: 8 });
+      const seen = new Set(rawResults.map((r) => r.url));
+      rawResults = rawResults.concat(broad.filter((r) => !seen.has(r.url))).slice(0, 8);
+    }
+  } else {
+    rawResults = await searchWeb(searchQuery, { count: 8 });
+  }
   const sources = annotateSources(rawResults);
 
   if (sources.length === 0) {
@@ -459,7 +539,7 @@ async function factCheckClaim(claim, context = null, pieceType = "news", volatil
   }
 
   const synthesis = await askClaudeForJson(FACT_CHECK_PROMPT(claim, context, sources, pieceType), {
-    maxTokens: 1500,
+    maxTokens: 4096,
   });
 
   // Enforce primary source definition and fill in lean/outlet data that Claude

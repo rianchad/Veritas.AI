@@ -2,7 +2,77 @@
 // content script, then streams claim extraction + fact-checking results from
 // the VeritasAI backend (server/) via Server-Sent Events.
 
-const API_BASE_URL = "https://veritasai-production-2477.up.railway.app";
+// Default backend. Users can override it under Settings → Backend URL (persisted in
+// chrome.storage.sync), so an installed extension can follow a redeployed server
+// without republishing.
+const DEFAULT_API_BASE_URL = "https://veritasai-production-2477.up.railway.app";
+let apiBaseUrl = DEFAULT_API_BASE_URL;
+
+/**
+ * True for hosts where plain http is acceptable: loopback, RFC 1918 ranges and .local names.
+ * @param {string} hostname - Hostname from a parsed URL (IPv6 literals keep their brackets).
+ * @returns {boolean}
+ */
+function isPrivateHost(hostname) {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) return true;
+  if (host === "::1") return true;
+  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!m) return false;
+  const a = Number(m[1]);
+  const b = Number(m[2]);
+  return a === 127 || a === 10 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31);
+}
+
+/**
+ * Normalizes a user-supplied backend URL to origin + path: trims, drops query/fragment and
+ * trailing slashes, rejects embedded credentials, and requires https except for private hosts.
+ * @param {string} value - Raw input from the settings field.
+ * @returns {string|null} Normalized URL, or null if empty or invalid.
+ */
+function normalizeBaseUrl(value) {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) return null;
+  try {
+    const url = new URL(trimmed);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    if (url.username || url.password) return null;
+    if (url.protocol === "http:" && !isPrivateHost(url.hostname)) return null;
+    return (url.origin + url.pathname).replace(/\/+$/, "");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Builds a user-facing message for a failed backend request.
+ * @param {number|null} status - HTTP status code, or null for a network failure.
+ * @returns {string}
+ */
+function backendErrorMessage(status) {
+  if (status === null) {
+    return `Couldn't reach the VeritasAI backend at ${apiBaseUrl}. Check your connection, or set a different Backend URL in Settings.`;
+  }
+  if (status === 404) {
+    return `The VeritasAI backend at ${apiBaseUrl} returned 404 — it may be offline or moved. Update the Backend URL in Settings.`;
+  }
+  return `Server returned ${status}.`;
+}
+
+/**
+ * Fetches a backend endpoint, translating network failures into readable errors.
+ * @param {string} path - Endpoint path beginning with "/".
+ * @param {RequestInit} [init] - Fetch options.
+ * @returns {Promise<Response>}
+ */
+async function fetchBackend(path, init) {
+  try {
+    return await fetch(`${apiBaseUrl}${path}`, init);
+  } catch {
+    throw new Error(backendErrorMessage(null));
+  }
+}
+
 // ---- DOM refs ---------------------------------------------------------------
 
 const analyzeBtn = document.getElementById("analyze-btn");
@@ -25,6 +95,10 @@ const shareToastEl = document.getElementById("share-toast");
 
 const selectionPopup = document.getElementById("selection-popup");
 
+const gearBtnEl = document.getElementById("header-gear-btn");
+const historyBtnEl = document.getElementById("header-history-btn");
+const settingsBackBtn = document.getElementById("settings-back-btn");
+const historyBackBtn = document.getElementById("history-back-btn");
 const settingsContentEl = document.getElementById("settings-content");
 const historyContentEl = document.getElementById("history-content");
 
@@ -76,6 +150,7 @@ const DEFAULT_SETTINGS = {
   claimCount: 5,
   confidenceFilter: "all",
   autoAnalyze: false,
+  backendUrl: "", // empty = DEFAULT_API_BASE_URL
 };
 
 let currentSettings = { ...DEFAULT_SETTINGS };
@@ -87,6 +162,7 @@ let currentSettings = { ...DEFAULT_SETTINGS };
 async function loadSettings() {
   const stored = await chrome.storage.sync.get("veritas_settings");
   currentSettings = { ...DEFAULT_SETTINGS, ...(stored.veritas_settings || {}) };
+  apiBaseUrl = normalizeBaseUrl(currentSettings.backendUrl) || DEFAULT_API_BASE_URL;
 }
 
 /**
@@ -96,6 +172,7 @@ async function loadSettings() {
  */
 async function saveSettings(patch) {
   currentSettings = { ...currentSettings, ...patch };
+  apiBaseUrl = normalizeBaseUrl(currentSettings.backendUrl) || DEFAULT_API_BASE_URL;
   await chrome.storage.sync.set({ veritas_settings: currentSettings });
 }
 
@@ -439,18 +516,42 @@ async function getActiveTab() {
 async function getArticleFromActiveTab() {
   const tab = await getActiveTab();
   if (!tab?.id) throw new Error("No active tab found.");
+  if (!tab.url) {
+    throw new Error(
+      "VeritasAI doesn't have access to this site. Click the VeritasAI toolbar icon on the page, or allow site access for the extension at chrome://extensions."
+    );
+  }
+  if (!/^(https?|file):/.test(tab.url)) {
+    throw new Error(
+      "VeritasAI can't read this page — Chrome doesn't let extensions run here. Open a news article in a normal tab."
+    );
+  }
 
-  // Programmatically inject content script if not already present
+  // Inject content.js for tabs that were already open when the extension was installed or
+  // updated (declared content scripts only run on pages loaded afterwards). Where it is
+  // already present, re-injection fails on the file's top-level const declarations and
+  // leaves the existing copy untouched.
   try {
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       files: ["content.js"],
     });
   } catch {
-    // Already injected — safe to ignore
+    // Already present, or not injectable — fall through to messaging the existing copy
   }
 
-  return chrome.tabs.sendMessage(tab.id, { type: "GET_ARTICLE" });
+  try {
+    return await chrome.tabs.sendMessage(tab.id, { type: "GET_ARTICLE" });
+  } catch {
+    if (tab.url.startsWith("file:")) {
+      throw new Error(
+        'VeritasAI can\'t read local files unless "Allow access to file URLs" is enabled for it at chrome://extensions.'
+      );
+    }
+    throw new Error(
+      "VeritasAI couldn't connect to this page. Reload the tab and try again; if it keeps failing, Chrome may be blocking extensions on this site."
+    );
+  }
 }
 
 /**
@@ -1138,14 +1239,14 @@ async function checkSingleClaim(claimText) {
   claimsListEl.insertBefore(li, claimsListEl.firstChild);
 
   try {
-    const response = await fetch(`${API_BASE_URL}/api/check-claim`, {
+    const response = await fetchBackend("/api/check-claim", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ claim: claimText, volatility: currentVolatility }),
     });
     if (!response.ok) {
       const body = await response.json().catch(() => ({}));
-      throw new Error(body.error || `Server returned ${response.status}.`);
+      throw new Error(body.error || backendErrorMessage(response.status));
     }
     const result = await response.json();
     fillClaimCard(result);
@@ -1165,8 +1266,12 @@ document.getElementById("selection-check-btn").addEventListener("click", () => {
 
 document.getElementById("selection-dismiss-btn").addEventListener("click", hideSelectionPopup);
 
-chrome.runtime.onMessage.addListener((message) => {
-  if (message.type === "TEXT_SELECTED") showSelectionPopup(message.text);
+chrome.runtime.onMessage.addListener((message, sender) => {
+  if (message?.type !== "TEXT_SELECTED" || !sender?.tab) return;
+  // Tabs in other windows broadcast here too — only react to the tab this panel shows.
+  getActiveTab().then((tab) => {
+    if (tab?.id === sender.tab.id) showSelectionPopup(message.text);
+  });
 });
 
 // ---- Share button -----------------------------------------------------------
@@ -1175,7 +1280,7 @@ shareBtnEl.addEventListener("click", async () => {
   shareBtnEl.disabled = true;
   shareBtnEl.textContent = "Generating link…";
   try {
-    const response = await fetch(`${API_BASE_URL}/api/share`, {
+    const response = await fetchBackend("/api/share", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1262,6 +1367,93 @@ function makeSelectRow(labelText, options, value, onChange) {
   select.addEventListener("change", () => onChange(select.value));
   row.append(label, select);
   return row;
+}
+
+/**
+ * Creates a titled settings section container.
+ * @param {string} title - Section heading text (e.g. "Analysis").
+ * @returns {HTMLDivElement}
+ */
+function makeSettingsSection(title) {
+  const section = document.createElement("div");
+  section.className = "settings-section";
+  const heading = document.createElement("p");
+  heading.className = "settings-section__heading";
+  heading.textContent = title;
+  section.appendChild(heading);
+  return section;
+}
+
+/**
+ * Creates the Backend URL block: an input prefilled with the saved override, a Save button
+ * that validates and persists it, and a status line that pings /health after saving.
+ * @returns {HTMLDivElement}
+ */
+function makeBackendUrlBlock() {
+  const wrapper = document.createElement("div");
+  wrapper.className = "settings-domain-group";
+
+  const subheading = document.createElement("p");
+  subheading.className = "settings-domain-group__title";
+  subheading.textContent = "Backend URL";
+
+  const inputRow = document.createElement("div");
+  inputRow.className = "settings-domain-input-row";
+  const input = document.createElement("input");
+  input.type = "url";
+  input.className = "settings-input";
+  input.placeholder = DEFAULT_API_BASE_URL;
+  input.value = currentSettings.backendUrl || "";
+  const saveBtn = document.createElement("button");
+  saveBtn.className = "btn btn--secondary btn--sm";
+  saveBtn.textContent = "Save";
+  inputRow.append(input, saveBtn);
+
+  const hint = document.createElement("p");
+  hint.className = "settings-hint";
+  const status = document.createElement("p");
+  status.className = "settings-hint";
+
+  /** Refreshes the hint line to show which backend is currently in use. */
+  function renderHint() {
+    hint.textContent = `Leave blank to use the default. Currently using ${apiBaseUrl}`;
+  }
+
+  /** Pings the backend's /health endpoint and reports the outcome in the status line. */
+  async function pingBackend() {
+    status.textContent = "Checking connection…";
+    try {
+      const response = await fetchBackend("/health");
+      if (response.ok) {
+        status.textContent = "Connected to backend.";
+      } else {
+        status.textContent = backendErrorMessage(response.status);
+      }
+    } catch (error) {
+      status.textContent = error.message;
+    }
+  }
+
+  saveBtn.addEventListener("click", async () => {
+    const raw = input.value.trim();
+    const normalized = normalizeBaseUrl(raw);
+    if (raw && !normalized) {
+      status.textContent =
+        "Enter a full https:// URL without credentials (http:// is only allowed for localhost and private networks).";
+      return;
+    }
+    await saveSettings({ backendUrl: normalized || "" });
+    input.value = normalized || "";
+    renderHint();
+    pingBackend();
+  });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") saveBtn.click();
+  });
+
+  renderHint();
+  wrapper.append(subheading, inputRow, hint, status);
+  return wrapper;
 }
 
 /**
@@ -1414,7 +1606,10 @@ function renderSettingsView() {
     )
   );
 
-  settingsContentEl.append(analysisSection, displaySection, domainSection);
+  const backendSection = makeSettingsSection("Backend");
+  backendSection.appendChild(makeBackendUrlBlock());
+
+  settingsContentEl.append(analysisSection, displaySection, domainSection, backendSection);
 }
 
 gearBtnEl.addEventListener("click", () => {
@@ -1556,7 +1751,7 @@ async function* readSseStream(response) {
  * @throws {Error} On HTTP error or fatal_error SSE event.
  */
 async function streamAnalysis(articleText, articleTitle = "", claimCount = 5) {
-  const response = await fetch(`${API_BASE_URL}/api/analyze`, {
+  const response = await fetchBackend("/api/analyze", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ articleText, articleTitle, claimCount }),
@@ -1564,7 +1759,7 @@ async function streamAnalysis(articleText, articleTitle = "", claimCount = 5) {
 
   if (!response.ok || !response.body) {
     const body = await response.json().catch(() => ({}));
-    throw new Error(body.error || `Server returned ${response.status}.`);
+    throw new Error(body.error || backendErrorMessage(response.status));
   }
 
   for await (const { event, data } of readSseStream(response)) {

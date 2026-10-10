@@ -18,7 +18,7 @@ Open any news article and click the VeritasAI icon. The sidebar extracts the art
 
 ### Claim Extraction
 
-Pulls 5-8 discrete factual claims from the article: statistics, attributed quotes, stated events, specific numbers. Vague assertions and opinion language get skipped.
+Pulls the 5 most important discrete factual claims from the article by default (configurable from 1 to 10, or Auto for 5–8): statistics, attributed quotes, stated events, specific numbers. Vague assertions and opinion language get skipped.
 
 Before claims load, the article gets classified as **News**, **Opinion/Editorial**, or **Analysis/Commentary**. Opinion and analysis pieces get a banner at the top of the sidebar.
 
@@ -26,7 +26,7 @@ Before claims load, the article gets classified as **News**, **Opinion/Editorial
 
 ### Per-Claim Verification
 
-Each claim runs through an agentic search loop backed by live Brave Search results. The agent picks a query, reads the results, decides whether it has enough evidence or needs to refine and search again — up to 3 iterations per claim.
+Each claim is searched once against live Brave Search results, using the claim's resolved context (pronouns and shorthand replaced with their referents) as the query. A single Claude synthesis call then weighs the eight lean-annotated results.
 
 Every claim returns a confidence level with a one-sentence rationale:
 
@@ -57,7 +57,7 @@ The labels show where the support for a claim is coming from across the spectrum
 
 ### Divergence Analysis
 
-A second agent runs alongside the verification agent for each claim. It searches for coverage of the same fact across outlets with different lean labels and extracts each outlet's specific framing.
+The same synthesis pass compares how the returned outlets with different lean labels frame the fact and extracts each outlet's specific position.
 
 The output shows individual positions: CNN says X, Fox says Y, primary BLS data says Z. When outlets cite the same underlying statistic and build different stories from it, that shows up clearly.
 
@@ -78,8 +78,9 @@ The 3-source threshold prevents false positives on claims with thin search resul
 The article headline and opening paragraphs get classified as **Breaking**, **Developing**, or **Stable** before fact-checking starts.
 
 - Breaking and Developing stories get a banner at the top of the sidebar
-- Sources older than 12 hours in a breaking story trigger a one-notch confidence downgrade
-- Sources older than 24 hours in a breaking story get visually muted on the card
+- Breaking stories are searched for coverage from the past day and Developing stories from the past week, falling back to an unfiltered search when recent coverage is thin
+- If the newest supporting or primary source for a claim is more than 10 hours old on a breaking or developing story, that claim's confidence drops one notch
+- Sources older than 24 hours in a breaking or developing story get visually muted on the card
 - Every source card shows a relative timestamp (e.g. _5 hours ago_) pulled from the search API
 - When publication dates are unavailable, recency adjustments are skipped
 
@@ -94,6 +95,7 @@ The article headline and opening paragraphs get classified as **Breaking**, **De
 | **Credibility Score**  | A live percentage bar updates as each claim streams in. Green 75%+, yellow 40%+, orange below that.                   |
 | **Streaming Results**  | Claims appear in the sidebar as they finish. First result shows up within seconds.                                    |
 | **Shareable Links**    | Generate a 7-day read-only link to the full fact-check. No extension required to view it.                             |
+| **Backend URL**        | Point the extension at a self-hosted or redeployed server from Settings → Backend URL.                                |
 
 ---
 
@@ -110,7 +112,7 @@ The article headline and opening paragraphs get classified as **Breaking**, **De
 
 ## How It Works
 
-Two agents run concurrently per claim over Server-Sent Events: a verification agent that loops through Brave Search queries until it finds sufficient evidence, and a divergence agent that fetches coverage across the lean spectrum and extracts each outlet's specific framing. Results stream back to the sidebar as each claim resolves.
+The backend classifies the article's volatility, extracts claims (with an entity-disambiguation pass so surnames become full names), then checks every claim in parallel: one Brave Search query, lean and primary-source annotation of the results, and one Claude synthesis call that returns the confidence level, cited sources, and coverage divergence together. Results stream back to the sidebar over Server-Sent Events as each claim resolves.
 
 No hard verdicts. On politically sensitive claims, a confident wrong verdict with no sources is worse than no verdict at all. Confidence levels and cited sources let the reader evaluate the evidence themselves.
 
@@ -127,12 +129,12 @@ flowchart TD
 
     subgraph server["Express Backend"]
         vol(Volatility Classifier):::srv
-        extractor(Claim Extractor):::srv
+        extractor(Claim Extractor + Disambiguation):::srv
 
         subgraph par["Per Claim — Parallel"]
             direction LR
-            verify(Verification Agent):::srv
-            diverge(Divergence Agent):::srv
+            search(Brave Search · 8 results):::srv
+            synth(Synthesis · confidence + divergence):::srv
         end
 
         sse(SSE Stream):::srv
@@ -144,38 +146,35 @@ flowchart TD
     content -->|article text| sidebar
     sidebar -->|POST /api/analyze| vol
     vol --> extractor
-    extractor --> verify
-    extractor --> diverge
-    verify --> sse
-    diverge --> sse
+    extractor --> search
+    search -->|lean-annotated sources| synth
+    synth --> sse
     sse -->|streams results| sidebar
 
-    verify -->|search| brave
-    diverge -->|search| brave
+    search -->|query| brave
     vol -->|inference| claude
     extractor -->|inference| claude
-    verify -->|inference| claude
-    diverge -->|inference| claude
+    synth -->|inference| claude
 ```
 
 ---
 
 ## Permissions
 
-| Permission                     | Why                                                                                                    |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------ |
-| `activeTab`                    | Reads the URL and title of the tab you're currently on so the extension knows which article to analyze |
-| `scripting`                    | Injects `content.js` into the page to extract the article body text                                    |
-| `sidePanel`                    | Opens the fact-check results in Chrome's native side panel                                             |
-| `storage`                      | Saves your API key and preferences locally so you don't have to re-enter them                          |
-| `host_permissions: <all_urls>` | Allows `content.js` to run on any news site, not just a hardcoded list                                 |
+| Permission                     | Why                                                                                                                                     |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `activeTab`                    | Reads the URL and title of the tab you choose to analyze and messages its content script                                                |
+| `scripting`                    | Injects `content.js` into the page to extract the article body text                                                                     |
+| `sidePanel`                    | Opens the fact-check results in Chrome's native side panel                                                                              |
+| `storage`                      | Keeps preferences and domain lists in Chrome storage (synced with your Chrome profile) and analysis history on this device; no API keys |
+| `host_permissions: <all_urls>` | Allows `content.js` to run on any news site, not just a hardcoded list                                                                  |
 
-VeritasAI does not collect, transmit, or store your browsing history. The only data that leaves your browser is the article text sent to the backend for analysis.
+VeritasAI does not collect, transmit, or store your browsing history. The data that leaves your browser is the article text and title sent to the backend for analysis and, only when you click Share, the article URL and results needed to render the share page.
 
 ---
 
 ## Credits
 
-- AI: [Anthropic Claude](https://anthropic.com) (`claude-sonnet-4-20250514`)
+- AI: [Anthropic Claude](https://anthropic.com) (`claude-haiku-4-5-20251001`)
 - Web search: [Brave Search API](https://brave.com/search/api/)
 - Source bias ratings: [Ad Fontes Media](https://adfontesmedia.com) and [AllSides](https://allsides.com)

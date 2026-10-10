@@ -243,6 +243,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       clearHighlight();
       sendResponse({ ok: true });
       break;
+    default:
+      sendResponse({ ok: false, error: `Unknown message type: ${message?.type}` });
   }
-  return true; // keep the message channel open for async sendResponse
+  // Every branch responds synchronously, so the channel can close right away.
+  return false;
 });

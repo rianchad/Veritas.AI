@@ -1,16 +1,39 @@
-require("dotenv").config();
+const path = require("path");
+
+// Load server/.env relative to this file so starting from the repo root works too.
+// Variables already present in the environment (e.g. Railway's) take precedence.
+require("dotenv").config({ path: path.join(__dirname, ".env"), quiet: true });
 
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
-const path = require("path");
 const Database = require("better-sqlite3");
 const rateLimit = require("express-rate-limit");
 const { classifyVolatility, extractClaims, factCheckClaim } = require("./pipeline");
 
+// Fail fast on missing credentials so a bad deploy is obvious in the logs instead of
+// surfacing as opaque per-claim errors in the sidebar.
+for (const name of ["ANTHROPIC_API_KEY", "BRAVE_SEARCH_API_KEY"]) {
+  if (!process.env[name]) {
+    console.error(`${name} is not set. Copy server/.env.example to server/.env and fill it in.`);
+    process.exit(1);
+  }
+}
+
 // ---- SQLite share store (7-day TTL) -----------------------------------------
 
-const db = new Database(path.join(__dirname, "shares.db"));
+// Share links live in SQLite. Railway/Render wipe the app filesystem on every deploy, so
+// point SHARES_DB_PATH at a persistent volume to honour the 7-day TTL across deploys
+// (Railway exposes its volume mount as RAILWAY_VOLUME_MOUNT_PATH).
+let dbPath;
+if (process.env.SHARES_DB_PATH) {
+  dbPath = process.env.SHARES_DB_PATH;
+} else if (process.env.RAILWAY_VOLUME_MOUNT_PATH) {
+  dbPath = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, "shares.db");
+} else {
+  dbPath = path.join(__dirname, "shares.db");
+}
+const db = new Database(dbPath);
 db.exec(`
   CREATE TABLE IF NOT EXISTS shares (
     id TEXT PRIMARY KEY,
@@ -32,7 +55,7 @@ setInterval(() => stmtPrune.run(Date.now()), 60 * 60 * 1000);
 
 const analyzeLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 10,
+  limit: 10,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many requests — please wait a minute and try again." },
@@ -40,16 +63,48 @@ const analyzeLimiter = rateLimit({
 
 const shareLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
-  max: 20,
+  limit: 20,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many share requests — limit is 20 per hour." },
 });
 
+// Each single-claim check costs a Brave query plus a Claude call, so cap it like /api/analyze.
+const checkClaimLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests — please wait a minute and try again." },
+});
+
 // ---- App setup --------------------------------------------------------------
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+
+// Behind a reverse proxy (Railway/Render/Fly terminate TLS and add one hop) Express must
+// trust that hop so express-rate-limit keys on the real client IP rather than the proxy
+// address (otherwise every user shares one rate-limit bucket) and so req.protocol /
+// req.get("host") reflect the public URL. Trusting a hop when no proxy exists would let
+// direct callers pick their own bucket via X-Forwarded-For, so default to one hop only on
+// a detected platform and to zero elsewhere. TRUST_PROXY_HOPS overrides either default.
+const onKnownProxyPlatform = Boolean(
+  process.env.RAILWAY_ENVIRONMENT || process.env.RENDER || process.env.FLY_APP_NAME
+);
+const rawTrustProxyHops = process.env.TRUST_PROXY_HOPS;
+let trustProxyHops;
+if (rawTrustProxyHops !== undefined && rawTrustProxyHops.trim() !== "") {
+  if (!/^\d+$/.test(rawTrustProxyHops.trim())) {
+    console.error("TRUST_PROXY_HOPS must be a non-negative integer.");
+    process.exit(1);
+  }
+  trustProxyHops = Number(rawTrustProxyHops.trim());
+} else if (onKnownProxyPlatform) {
+  trustProxyHops = 1;
+} else {
+  trustProxyHops = 0;
+}
+app.set("trust proxy", trustProxyHops);
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
@@ -65,18 +120,27 @@ if (allowedOrigins.length > 0) {
   corsOrigin = true;
 }
 app.use(cors({ origin: corsOrigin }));
+app.use(express.json({ limit: "1mb" }));
 
 app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
 
+// The canonical policy is hosted with the landing page. Serve the local copy when the whole
+// repo is deployed; when only server/ is deployed the file is absent, so redirect instead.
+const PRIVACY_POLICY_URL =
+  process.env.PRIVACY_POLICY_URL || "https://www.veritas-ai.news/privacypolicy";
 app.get("/privacypolicy", (req, res) => {
-  res.sendFile(path.join(__dirname, "../landing/privacypolicy.html"));
+  res.sendFile(path.join(__dirname, "../landing/privacypolicy.html"), (error) => {
+    if (error && !res.headersSent) {
+      res.redirect(302, PRIVACY_POLICY_URL);
+    }
+  });
 });
 
 // Fact-checks a single user-supplied claim (used by the text-selection flow).
 // Returns plain JSON rather than SSE since there's only one result.
-app.post("/api/check-claim", async (req, res) => {
+app.post("/api/check-claim", checkClaimLimiter, async (req, res) => {
   const { claim, volatility } = req.body || {};
   if (typeof claim !== "string" || claim.trim().length < 10) {
     return res.status(400).json({ error: "claim must be at least 10 characters." });
@@ -189,13 +253,15 @@ app.post("/api/share", shareLimiter, (req, res) => {
   });
   stmtInsert.run(id, data, Date.now() + SHARE_TTL_MS);
 
+  // Prefer an explicit PUBLIC_URL; otherwise derive it from the request, which is correct
+  // behind Railway/Render's proxy thanks to the trust-proxy setting above.
   let baseUrl;
   if (process.env.PUBLIC_URL) {
     baseUrl = process.env.PUBLIC_URL;
   } else {
-    const port = process.env.PORT || 8787;
-    baseUrl = `http://localhost:${port}`;
+    baseUrl = `${req.protocol}://${req.host}`; // Express 5: honours X-Forwarded-Host, keeps port
   }
+  baseUrl = baseUrl.replace(/\/+$/, "");
   res.json({ shareUrl: `${baseUrl}/share/${id}` });
 });
 
@@ -213,6 +279,7 @@ app.get("/share/:id", (req, res) => {
     month: "short",
     day: "numeric",
     year: "numeric",
+    timeZone: "UTC",
   });
 
   const CONF_VALUES = { high: 1.0, medium: 0.5, low: 0.0 };
@@ -276,6 +343,30 @@ app.get("/share/:id", (req, res) => {
   }
 
   /**
+   * Formats a source's publication date for the share page. Relative strings such as
+   * "2 hours ago" go stale over the link's 7-day life, so prefer an absolute date.
+   * @param {{publishedAt?: string, age?: string}} source - Source with optional date fields.
+   * @returns {string} Formatted date, the relative age, or an empty string.
+   */
+  function formatSourceDate(source) {
+    let ms;
+    if (source.publishedAt) {
+      ms = new Date(source.publishedAt).getTime();
+    } else {
+      ms = NaN;
+    }
+    if (Number.isFinite(ms)) {
+      return new Date(ms).toLocaleDateString("en-US", {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+        timeZone: "UTC",
+      });
+    }
+    return source.age || "";
+  }
+
+  /**
    * Renders an HTML source list for a given label and source array.
    * @param {string} label - Section heading text (e.g. "Supporting sources").
    * @param {Array<{outlet?: string, lean?: string, age?: string, title?: string, url: string}>} sources
@@ -287,7 +378,7 @@ app.get("/share/:id", (req, res) => {
     }
     const items = sources
       .map((s) => {
-        const metaParts = [s.outlet, s.lean, s.age].filter(Boolean).join(" · ");
+        const metaParts = [s.outlet, s.lean, formatSourceDate(s)].filter(Boolean).join(" · ");
         let titleHtml;
         if (s.title) {
           titleHtml = escHtml(s.title);
@@ -499,7 +590,39 @@ a:hover{color:var(--text)}
   res.send(html);
 });
 
+// Final error handler: keep error responses JSON so the sidebar can surface
+// body.error (body-parser rejections would otherwise render Express's HTML page).
+app.use((error, req, res, _next) => {
+  let status;
+  if (Number.isInteger(error.status)) {
+    status = error.status;
+  } else {
+    status = 500;
+  }
+  let message;
+  if (error.type === "entity.parse.failed") {
+    message = "Request body must be valid JSON.";
+  } else if (error.type === "entity.too.large") {
+    message = "Request body is too large (limit 1mb).";
+  } else if (status >= 500) {
+    console.error(error);
+    message = "Internal server error.";
+  } else {
+    message = error.message;
+  }
+  if (res.headersSent) {
+    return res.end();
+  }
+  res.status(status).json({ error: message });
+});
+
 const port = process.env.PORT || 8787;
-app.listen(port, () => {
-  console.log(`VeritasAI server listening on port ${port}`);
+app.listen(port, (error) => {
+  if (error) {
+    console.error(`Failed to bind port ${port}:`, error);
+    process.exit(1);
+  }
+  console.log(
+    `VeritasAI server listening on port ${port} (trust proxy: ${trustProxyHops} hop(s), shares db: ${dbPath})`
+  );
 });

@@ -1,7 +1,8 @@
 {
   "manifest_version": 3,
+  "minimum_chrome_version": "114",
   "name": "VeritasAI",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Real-time AI fact-checking for news articles. Claim-by-claim verification with source diversity and political lean labels.",
   "icons": {
     "16": "icons/icon16.png",

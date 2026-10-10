@@ -1,7 +1,11 @@
 node_modules/
 .env
 *.log
-INSTRUCTIONS.md
+/INSTRUCTIONS.md
 CLAUDE.md
 DEVLOGS.md
 .claude/
+server/*.db
+server/*.db-journal
+server/*.db-wal
+server/*.db-shm

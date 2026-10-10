@@ -1,6 +1,6 @@
 {
   "name": "veritas-ai-extension",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "VeritasAI Chrome extension — real-time fact-checking via a side panel",
   "private": true,
   "scripts": {
@@ -8,6 +8,6 @@
     "format:check": "prettier --check ."
   },
   "devDependencies": {
-    "prettier": "^3.3.3"
+    "prettier": "^3.9.10"
   }
 }
